@@ -19,27 +19,31 @@ def signin(usr, pwd):
     signin = session.post("https://zyserver.zybooks.com/v1/signin", json={"email": usr, "password": pwd}).json()
     if not signin["success"]:
         raise Exception("Failed to sign in")
+    token = signin["session"]["auth_token"]
+    session.headers.update({"Authorization": f"Bearer {token}"})
     return signin
 
-# Return all books along with their metadata
-def get_books(auth, usr_id):
-    books = session.get(f"https://zyserver.zybooks.com/v1/user/{usr_id}/items?items=%5B%22zybooks%22%5D&auth_token={auth}").json()
-    if not books["success"]:
-        raise Exception("Failed to get books")
-    books = books["items"]["zybooks"]
-    for book in books:
-        if book["autosubscribe"]:
-            books.remove(book)
+def get_books(usr_id):
+    url = f"https://zyserver.zybooks.com/v1/user/{usr_id}/items?items=%5B%22zybooks%22%5D"
+    r = session.get(url, timeout=20)
+
+    data = r.json()
+    if not data.get("success"):
+        raise Exception(f"Failed to get books: {data}")
+
+    books = data["items"]["zybooks"]
+    books = [b for b in books if not b.get("autosubscribe")]
     return books
 
+
 # Gets chapters along with their sections
-def get_chapters(code, auth):
-    chapters = session.get(f"https://zyserver.zybooks.com/v1/zybooks?zybooks=%5B%22{code}%22%5D&auth_token={auth}").json()
+def get_chapters(code):
+    chapters = session.get(f"https://zyserver.zybooks.com/v1/zybooks?zybooks=%5B%22{code}%22%5D").json()
     return chapters["zybooks"][0]["chapters"]
 
 # Returns all problems in a section
-def get_problems(code, chapter, section, auth):
-    problems = session.get(f"https://zyserver.zybooks.com/v1/zybook/{code}/chapter/{chapter}/section/{section}?auth_token={auth}").json()
+def get_problems(code, chapter, section):
+    problems = session.get(f"https://zyserver.zybooks.com/v1/zybook/{code}/chapter/{chapter}/section/{section}").json()
     return problems["section"]["content_resources"]
 
 # Spoofs "time_spent" anywhere from 1 to 60 seconds.
@@ -105,12 +109,12 @@ def solve_section(section, code, chapter, auth):
     print(f"Starting section {sec_name}")
     sec_id = section["canonical_section_id"]
     try:
-        problems = get_problems(code, chapter["number"], section["number"], auth)
+        problems = get_problems(code, chapter["number"], section["number"])
     except KeyError as e:
         print(f"Failed solving {sec_name}")
         print(f"{str(e)} is missing, retrying with canonical section number...")
         try:
-            problems = get_problems(code, chapter["number"], section["canonical_section_number"], auth)
+            problems = get_problems(code, chapter["number"], section["canonical_section_number"])
             pass
         except KeyError:
             print(f"Failed solving {chapter['number']}.{section['canonical_section_number']}")
@@ -143,7 +147,7 @@ def main():
         while True:
             try:
                 # Get all books and have user select one
-                books = get_books(auth, usr_id)
+                books = get_books(usr_id)
                 i = 1
                 for book in books:
                     print(f"{i}. {book['title']}")
@@ -167,7 +171,7 @@ def main():
 
                 # Get all chapters in selected book and have user select one
                 code = book["zybook_code"]
-                chapters = get_chapters(code, auth)
+                chapters = get_chapters(code)
                 print("\n")
                 for chapter in chapters:
                     print(f'{chapter["number"]}. {chapter["title"]}')
