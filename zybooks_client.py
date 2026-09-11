@@ -13,6 +13,7 @@ from urllib import parse
 import requests
 
 from progress_detection import resource_complete, section_complete
+from section_numbers import section_number
 
 
 class ZybooksError(RuntimeError):
@@ -129,18 +130,20 @@ class ZybooksClient:
         output = []
         jobs = []
         for chapter in chapters:
-            chapter_view = {"number": chapter["number"], "title": chapter.get("title", ""), "sections": []}
+            chapter_num = int(chapter["number"])
+            chapter_view = {"number": chapter_num, "title": chapter.get("title", ""), "sections": []}
             output.append(chapter_view)
             for section in chapter.get("sections", []):
-                sec_num = section.get("canonical_section_number", section.get("number"))
+                sec_num = section_number(section, chapter_num)
                 section_view = {
                     "number": sec_num,
+                    "canonical_section_number": section.get("canonical_section_number"),
                     "title": section.get("title", ""),
                     "canonical_section_id": section.get("canonical_section_id"),
                     "progress": {"complete": False, "completed": 0, "total": 0, "loading": True},
                 }
                 chapter_view["sections"].append(section_view)
-                jobs.append((int(chapter["number"]), int(sec_num), section_view))
+                jobs.append((chapter_num, sec_num, section_view))
         workers = min(8, max(1, len(jobs)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             future_map = {pool.submit(self.get_section_progress, code, c, s): view for c, s, view in jobs}
