@@ -82,6 +82,17 @@ class ZybooksClient:
         return 0
 
     @staticmethod
+    def _submission_part_count(resource: dict) -> int:
+        """Return how many activity submissions to make.
+
+        The upstream ZybookAuto implementation submits part=0 when ZyBooks reports
+        parts == 0. Some participation activities (including tour-style resources)
+        use that representation, so zero cannot be treated as 'nothing to do'.
+        """
+        count = ZybooksClient._part_count(resource)
+        return count if count > 0 else 1
+
+    @staticmethod
     def _resource_complete(resource: dict) -> bool:
         if resource.get("complete") is True or resource.get("completed") is True:
             return True
@@ -207,8 +218,9 @@ class ZybooksClient:
         if section_id is None:
             raise ZybooksError("Section has no canonical_section_id")
 
-        resources = [r for r in data.get("content_resources", []) if self._part_count(r) > 0]
-        total_parts = sum(self._part_count(r) for r in resources if not self._resource_complete(r))
+        resources = [r for r in data.get("content_resources", []) if r.get("id") is not None]
+        pending = [r for r in resources if not self._resource_complete(r)]
+        total_parts = sum(self._submission_part_count(r) for r in pending)
         submitted = 0
         emit(stage="starting", total_parts=total_parts, submitted=0)
 
@@ -216,18 +228,18 @@ class ZybooksClient:
             if self._resource_complete(resource):
                 continue
             activity_id = resource.get("id")
-            raw_parts = self._part_count(resource)
-            if not activity_id or raw_parts <= 0:
+            submission_parts = self._submission_part_count(resource)
+            if not activity_id:
                 continue
 
-            for part in range(raw_parts):
+            for part in range(submission_parts):
                 delay = random.uniform(min(min_delay, max_delay), max(min_delay, max_delay))
                 emit(
                     stage="waiting",
                     activity=resource_index,
                     activities=len(resources),
                     part=part + 1,
-                    parts=raw_parts,
+                    parts=submission_parts,
                     delay=round(delay, 1),
                     submitted=submitted,
                     total_parts=total_parts,
@@ -241,7 +253,7 @@ class ZybooksClient:
                             activity=resource_index,
                             activities=len(resources),
                             part=part + 1,
-                            parts=raw_parts,
+                            parts=submission_parts,
                             attempt=attempt + 1,
                             submitted=submitted,
                             total_parts=total_parts,
