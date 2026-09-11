@@ -12,6 +12,8 @@ from urllib import parse
 
 import requests
 
+from progress_detection import resource_complete, section_complete
+
 
 class ZybooksError(RuntimeError):
     pass
@@ -62,6 +64,7 @@ class ZybooksClient:
         data = self._json(self.session.get(
             f"{self.API}/zybooks",
             params={"zybooks": json.dumps([code])},
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
             timeout=15,
         ))
         return data["zybooks"][0]["chapters"]
@@ -69,6 +72,7 @@ class ZybooksClient:
     def get_section(self, code: str, chapter: int, section: int):
         return self._json(self.session.get(
             f"{self.API}/zybook/{code}/chapter/{chapter}/section/{section}",
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
             timeout=12,
         ))["section"]
 
@@ -94,33 +98,31 @@ class ZybooksClient:
 
     @staticmethod
     def _resource_complete(resource: dict) -> bool:
-        if resource.get("complete") is True or resource.get("completed") is True:
-            return True
-        parts = resource.get("parts")
-        if isinstance(parts, list) and parts:
-            states = []
-            for part in parts:
-                if isinstance(part, dict):
-                    states.append(bool(part.get("complete") or part.get("completed")))
-            if states:
-                return all(states)
-        progress = resource.get("progress")
-        if isinstance(progress, dict):
-            if progress.get("complete") is True:
-                return True
-            completed = progress.get("completed")
-            total = progress.get("total")
-            if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
-                return completed >= total
-        return False
+        return resource_complete(resource)
 
     def get_section_progress(self, code: str, chapter: int, section: int):
         data = self.get_section(code, chapter, section)
         resources = data.get("content_resources", [])
-        completable = [r for r in resources if self._part_count(r) > 0 or "activity" in str(r.get("type", "")).lower()]
+        completable = [
+            r for r in resources
+            if self._part_count(r) > 0
+            or "activity" in str(r.get("type", "")).lower()
+            or "participation" in str(r.get("type", "")).lower()
+            or "challenge" in str(r.get("type", "")).lower()
+        ]
         completed = sum(1 for r in completable if self._resource_complete(r))
         total = len(completable)
-        return {"complete": total > 0 and completed == total, "completed": completed, "total": total, "resources": resources}
+        complete, reason = section_complete(data, completable)
+        if not complete and total > 0 and completed == total:
+            complete = True
+            reason = "all recognized activity resources report complete"
+        return {
+            "complete": complete,
+            "completed": completed,
+            "total": total,
+            "reason": reason,
+            "resources": resources,
+        }
 
     def get_book_outline_with_progress(self, code: str):
         chapters = self.get_chapters(code)
