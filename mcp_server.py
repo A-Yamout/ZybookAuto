@@ -8,7 +8,7 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
-from app import build_client, ensure_worker, store, worker_pause
+from app import build_client, store
 
 HOST = os.getenv("ZYBOOKAUTO_MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("ZYBOOKAUTO_MCP_PORT", "20030"))
@@ -39,7 +39,9 @@ mcp = FastMCP(
     json_response=True,
     token_verifier=StaticTokenVerifier(),
     auth=AuthSettings(
-        issuer_url=AnyHttpUrl(os.getenv("ZYBOOKAUTO_MCP_ISSUER", f"http://localhost:{PORT}/")),
+        issuer_url=AnyHttpUrl(
+            os.getenv("ZYBOOKAUTO_MCP_ISSUER", f"http://localhost:{PORT}/")
+        ),
         resource_server_url=AnyHttpUrl(PUBLIC_URL),
         required_scopes=["zybookauto:control"],
     ),
@@ -54,11 +56,16 @@ def list_books() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def queue_chapter(book_code: str, chapter_number: int, skip_complete: bool = True) -> dict[str, Any]:
+def queue_chapter(
+    book_code: str, chapter_number: int, skip_complete: bool = True
+) -> dict[str, Any]:
     """Queue all sections in one chapter after refreshing each section's completion state."""
     client = build_client()
     chapters = client.get_chapters(book_code)
-    chapter = next((c for c in chapters if int(c.get("number", -1)) == int(chapter_number)), None)
+    chapter = next(
+        (c for c in chapters if int(c.get("number", -1)) == int(chapter_number)),
+        None,
+    )
     if chapter is None:
         raise ValueError(f"Chapter {chapter_number} was not found in {book_code}")
 
@@ -66,41 +73,64 @@ def queue_chapter(book_code: str, chapter_number: int, skip_complete: bool = Tru
     skipped = []
     checks = []
     for section in chapter.get("sections", []):
-        section_number = int(section.get("canonical_section_number", section.get("number")))
+        section_number = int(
+            section.get("canonical_section_number", section.get("number"))
+        )
         title = section.get("title", "")
         progress = None
 
         if skip_complete:
             try:
-                progress = client.get_section_progress(book_code, int(chapter_number), section_number)
-                checks.append({
-                    "section": section_number,
-                    "complete": bool(progress.get("complete")),
-                    "completed": progress.get("completed", 0),
-                    "total": progress.get("total", 0),
-                    "reason": progress.get("reason", "no reason reported"),
-                })
-                if progress.get("complete"):
-                    skipped.append({
+                progress = client.get_section_progress(
+                    book_code, int(chapter_number), section_number
+                )
+                checks.append(
+                    {
                         "section": section_number,
-                        "title": title,
-                        "reason": progress.get("reason", "already complete"),
-                    })
+                        "complete": bool(progress.get("complete")),
+                        "completed": progress.get("completed", 0),
+                        "total": progress.get("total", 0),
+                        "reason": progress.get("reason", "no reason reported"),
+                    }
+                )
+                if progress.get("complete"):
+                    skipped.append(
+                        {
+                            "section": section_number,
+                            "title": title,
+                            "reason": progress.get("reason", "already complete"),
+                        }
+                    )
                     continue
             except Exception as exc:
-                skipped.append({"section": section_number, "title": title, "reason": f"progress check failed: {exc}"})
-                checks.append({"section": section_number, "complete": None, "reason": f"progress check failed: {exc}"})
+                skipped.append(
+                    {
+                        "section": section_number,
+                        "title": title,
+                        "reason": f"progress check failed: {exc}",
+                    }
+                )
+                checks.append(
+                    {
+                        "section": section_number,
+                        "complete": None,
+                        "reason": f"progress check failed: {exc}",
+                    }
+                )
                 continue
 
         job_id = store.enqueue(book_code, int(chapter_number), section_number, title)
-        queued.append({
-            "job_id": job_id,
-            "section": section_number,
-            "title": title,
-            "completion_check": progress.get("reason") if progress else "skip_complete disabled",
-        })
+        queued.append(
+            {
+                "job_id": job_id,
+                "section": section_number,
+                "title": title,
+                "completion_check": (
+                    progress.get("reason") if progress else "skip_complete disabled"
+                ),
+            }
+        )
 
-    ensure_worker()
     return {
         "book_code": book_code,
         "chapter": int(chapter_number),
@@ -109,7 +139,7 @@ def queue_chapter(book_code: str, chapter_number: int, skip_complete: bool = Tru
         "queued": queued,
         "skipped": skipped,
         "completion_checks": checks,
-        "worker_paused": not worker_pause.is_set(),
+        "worker_paused": not store.worker_enabled(),
     }
 
 
@@ -134,8 +164,10 @@ def queue_sections(book_code: str, sections: list[str]) -> dict[str, Any]:
 
         section = next(
             (
-                s for s in chapter.get("sections", [])
-                if int(s.get("canonical_section_number", s.get("number"))) == section_number
+                s
+                for s in chapter.get("sections", [])
+                if int(s.get("canonical_section_number", s.get("number")))
+                == section_number
             ),
             None,
         )
@@ -146,32 +178,32 @@ def queue_sections(book_code: str, sections: list[str]) -> dict[str, Any]:
         job_id = store.enqueue(book_code, chapter_number, section_number, title)
         queued.append({"job_id": job_id, "section": selector, "title": title})
 
-    ensure_worker()
-    return {"queued_count": len(queued), "queued": queued, "worker_paused": not worker_pause.is_set()}
+    return {
+        "queued_count": len(queued),
+        "queued": queued,
+        "worker_paused": not store.worker_enabled(),
+    }
 
 
 @mcp.tool()
 def start_queue() -> dict[str, Any]:
-    """Start or resume background processing of queued work."""
-    ensure_worker()
-    worker_pause.set()
+    """Start or resume the shared background worker owned by app.py."""
+    store.set_worker_enabled(True)
     return {"started": True, "worker_paused": False}
 
 
 @mcp.tool()
 def pause_queue() -> dict[str, Any]:
-    """Pause the worker before it begins another queued job."""
-    worker_pause.clear()
+    """Pause before the worker begins another queued job."""
+    store.set_worker_enabled(False)
     return {"paused": True}
 
 
 @mcp.tool()
 def stop_queued_work() -> dict[str, Any]:
-    """Cancel all jobs that have not started yet and pause the worker."""
-    worker_pause.clear()
-    with store.lock, store._conn() as conn:
-        cur = conn.execute("UPDATE jobs SET status='cancelled' WHERE status='queued'")
-        cancelled = cur.rowcount
+    """Cancel all jobs that have not started yet and pause the shared worker."""
+    store.set_worker_enabled(False)
+    cancelled = store.cancel_queued()
     return {"cancelled": cancelled, "worker_paused": True}
 
 
@@ -183,8 +215,7 @@ def get_progress(limit: int = 50) -> dict[str, Any]:
     for job in jobs:
         counts[job["status"]] = counts.get(job["status"], 0) + 1
 
-    running = next((job for job in jobs if job["status"] == "running"), None)
-    total = sum(counts.values())
+    running_jobs = [job for job in jobs if job["status"] == "running"]
     finished = (
         counts.get("done", 0)
         + counts.get("submitted", 0)
@@ -194,11 +225,12 @@ def get_progress(limit: int = 50) -> dict[str, Any]:
     )
 
     return {
-        "worker_paused": not worker_pause.is_set(),
-        "running": running,
+        "worker_paused": not store.worker_enabled(),
+        "running": running_jobs[0] if running_jobs else None,
+        "running_count": len(running_jobs),
         "counts": counts,
         "finished_jobs": finished,
-        "total_jobs_returned": total,
+        "total_jobs_returned": sum(counts.values()),
         "jobs": jobs,
     }
 
