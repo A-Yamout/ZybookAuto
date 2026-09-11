@@ -3,19 +3,43 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from pydantic import AnyHttpUrl
+from mcp.server import MCPServer
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 
 from app import build_client, ensure_worker, store, worker_pause
 
-# Intentionally unauthenticated and network-reachable, per project requirements.
-# 0.0.0.0 makes the MCP endpoint listen on every IPv4 interface.
 HOST = os.getenv("ZYBOOKAUTO_MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("ZYBOOKAUTO_MCP_PORT", "20030"))
+TOKEN = os.getenv("ZYBOOKAUTO_MCP_TOKEN", "")
+PUBLIC_URL = os.getenv("ZYBOOKAUTO_MCP_PUBLIC_URL", f"http://localhost:{PORT}/mcp")
 
-mcp = FastMCP(
+if not TOKEN:
+    raise RuntimeError(
+        "ZYBOOKAUTO_MCP_TOKEN is required when the network MCP server is enabled"
+    )
+
+
+class StaticTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if token != TOKEN:
+            return None
+        return AccessToken(
+            token=token,
+            client_id="zybookauto-agent",
+            scopes=["zybookauto:control"],
+        )
+
+
+mcp = MCPServer(
     "ZybookAuto",
-    host=HOST,
-    port=PORT,
+    token_verifier=StaticTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(os.getenv("ZYBOOKAUTO_MCP_ISSUER", f"http://localhost:{PORT}/")),
+        resource_server_url=AnyHttpUrl(PUBLIC_URL),
+        required_scopes=["zybookauto:control"],
+    ),
 )
 
 
@@ -113,7 +137,7 @@ def start_queue() -> dict[str, Any]:
 
 @mcp.tool()
 def pause_queue() -> dict[str, Any]:
-    """Pause after the currently running operation reaches its next pause point."""
+    """Pause the worker before it begins another queued job."""
     worker_pause.clear()
     return {"paused": True}
 
@@ -138,7 +162,13 @@ def get_progress(limit: int = 50) -> dict[str, Any]:
 
     running = next((job for job in jobs if job["status"] == "running"), None)
     total = sum(counts.values())
-    finished = counts.get("done", 0) + counts.get("submitted", 0) + counts.get("accepted", 0) + counts.get("failed", 0) + counts.get("cancelled", 0)
+    finished = (
+        counts.get("done", 0)
+        + counts.get("submitted", 0)
+        + counts.get("accepted", 0)
+        + counts.get("failed", 0)
+        + counts.get("cancelled", 0)
+    )
 
     return {
         "worker_paused": not worker_pause.is_set(),
@@ -151,5 +181,9 @@ def get_progress(limit: int = 50) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    transport = os.getenv("ZYBOOKAUTO_MCP_TRANSPORT", "streamable-http")
-    mcp.run(transport=transport)
+    mcp.run(
+        transport="streamable-http",
+        host=HOST,
+        port=PORT,
+        streamable_http_path="/mcp",
+    )
