@@ -278,4 +278,4 @@ def api_clear():
 
 if __name__ == "__main__":
     ensure_worker()
-    app.run(host="127.0.0.1", port=int(os.getenv("PORT", "8765")), debug=False)
+    app.run(host=os.getenv("APP_HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8765")), debug=False)
