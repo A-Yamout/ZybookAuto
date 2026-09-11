@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ZybookAuto Dashboard</title>
+  <style>
+    :root{color-scheme:dark;--bg:#07111f;--card:#0d1b2d;--muted:#91a3b8;--line:#1f3349;--accent:#69a7ff;--good:#5bd6a2;--bad:#ff7b83}*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui;background:var(--bg);color:#eef5ff}.wrap{max-width:1180px;margin:0 auto;padding:32px 20px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px}h1{margin:0;font-size:30px}.muted{color:var(--muted)}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin-top:18px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,select,button{background:#091625;color:#eef5ff;border:1px solid var(--line);border-radius:9px;padding:10px 12px}button{cursor:pointer}button.primary{background:var(--accent);color:#06101d;border:0;font-weight:700}button.good{background:var(--good);color:#06101d;border:0}.book{padding:12px;border-bottom:1px solid var(--line);cursor:pointer}.chapter{margin-top:14px;border:1px solid var(--line);border-radius:12px;overflow:hidden}.chapter h3{padding:12px 14px;margin:0;background:#0a1727}.section{display:grid;grid-template-columns:34px 80px 1fr 150px;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--line)}.done{color:var(--good)}.failed{color:var(--bad)}#toast{min-height:24px}.job{display:grid;grid-template-columns:60px 1fr 100px;gap:10px;padding:8px;border-bottom:1px solid var(--line)}@media(max-width:700px){.section{grid-template-columns:30px 55px 1fr}.section .progress{grid-column:2/4}.top{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body><div class="wrap">
+  <div class="top"><div><h1>ZybookAuto</h1><div class="muted">Progress-aware section queue</div></div><div class="row"><button onclick="loadBooks()">Refresh books</button><button onclick="loadJobs()">Refresh queue</button></div></div>
+
+  <div class="card">
+    <form method="post" action="/settings" class="row">
+      <input name="email" type="email" placeholder="ZyBooks email">
+      <input name="password" type="password" placeholder="ZyBooks password">
+      <input name="min_delay" type="number" min="0" step="1" value="{{ min_delay }}" title="Minimum delay seconds">
+      <input name="max_delay" type="number" min="0" step="1" value="{{ max_delay }}" title="Maximum delay seconds">
+      <input name="retries" type="number" min="1" max="10" value="{{ retries }}" title="Retries">
+      <button class="primary" type="submit">Save settings</button>
+    </form>
+    <div class="muted" style="margin-top:8px">Credentials remain in the local SQLite database. For better security, set ZYBOOKS_EMAIL and ZYBOOKS_PASSWORD as environment variables instead.</div>
+  </div>
+
+  <div id="toast" class="muted"></div>
+  <div class="card"><h2>Books</h2><div id="books">Loading…</div></div>
+  <div class="card"><div class="row"><h2 style="flex:1">Sections</h2><button onclick="selectIncomplete()">Select incomplete</button><button class="primary" onclick="queueSelected()">Queue selected</button></div><div id="outline" class="muted">Select a book.</div></div>
+  <div class="card"><div class="row"><h2 style="flex:1">Background queue</h2><button onclick="post('/api/jobs/pause')">Pause</button><button class="good" onclick="post('/api/jobs/resume')">Resume</button><button onclick="post('/api/jobs/stop')">Stop queued</button><button onclick="post('/api/jobs/clear')">Clear finished</button></div><div id="jobs"></div></div>
+</div>
+<script>
+let currentBook=null, outline=null;
+const toast=t=>document.getElementById('toast').textContent=t;
+async function get(url){const r=await fetch(url);const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
+async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):'{}'});const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);await loadJobs();return j}
+async function loadBooks(){try{toast('Syncing books…');const books=await get('/api/books');document.getElementById('books').innerHTML=books.map(b=>`<div class="book" onclick="loadBook('${b.zybook_code}')"><b>${esc(b.title||b.zybook_code)}</b><div class="muted">${esc(b.zybook_code)}</div></div>`).join('')||'No books found.';toast('Books synced.')}catch(e){toast(e.message)}}
+async function loadBook(code){try{currentBook=code;toast('Reading current completion state…');outline=await get('/api/book/'+encodeURIComponent(code));renderOutline();toast('Progress synced.')}catch(e){toast(e.message)}}
+function renderOutline(){const el=document.getElementById('outline');el.className='';el.innerHTML=outline.chapters.map(c=>`<div class="chapter"><h3>Chapter ${c.number}: ${esc(c.title)}</h3>${c.sections.map(s=>{const p=s.progress||{};const done=p.complete;return `<label class="section"><input class="sec" type="checkbox" ${done?'disabled':''} data-chapter="${c.number}" data-section="${s.number}" data-title="${attr(s.title)}"><span>${c.number}.${s.number}</span><span>${esc(s.title)}</span><span class="progress ${done?'done':''}">${done?'Complete':`${p.completed||0}/${p.total||0} complete`}${p.error?' · sync error':''}</span></label>`}).join('')}</div>`).join('')}
+function selectIncomplete(){document.querySelectorAll('.sec:not(:disabled)').forEach(x=>x.checked=true)}
+async function queueSelected(){const items=[...document.querySelectorAll('.sec:checked')].map(x=>({chapter:+x.dataset.chapter,section:+x.dataset.section,title:x.dataset.title}));if(!items.length)return toast('Select at least one incomplete section.');try{const j=await post('/api/queue',{book_code:currentBook,items});toast(`Queued ${j.queued} section(s).`)}catch(e){toast(e.message)}}
+async function loadJobs(){try{const d=await get('/api/jobs');document.getElementById('jobs').innerHTML=`<div class="muted">Worker: ${d.paused?'paused':'running'}</div>`+d.jobs.map(j=>`<div class="job"><span>#${j.id}</span><span>${esc(j.book_code)} ${j.chapter}.${j.section} · ${esc(j.title)}${j.error?`<div class="failed">${esc(j.error)}</div>`:''}</span><b class="${j.status==='done'?'done':j.status==='failed'?'failed':''}">${j.status}</b></div>`).join('')}catch(e){toast(e.message)}}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}function attr(s){return esc(s).replace(/`/g,'&#096;')}
+loadBooks();loadJobs();setInterval(loadJobs,3000);
+</script></body></html>
