@@ -4,9 +4,9 @@ import os
 from typing import Any
 
 from pydantic import AnyHttpUrl
-from mcp.server import MCPServer
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.fastmcp import FastMCP
 
 from app import build_client, ensure_worker, store, worker_pause
 
@@ -16,9 +16,7 @@ TOKEN = os.getenv("ZYBOOKAUTO_MCP_TOKEN", "")
 PUBLIC_URL = os.getenv("ZYBOOKAUTO_MCP_PUBLIC_URL", f"http://localhost:{PORT}/mcp")
 
 if not TOKEN:
-    raise RuntimeError(
-        "ZYBOOKAUTO_MCP_TOKEN is required when the network MCP server is enabled"
-    )
+    raise RuntimeError("ZYBOOKAUTO_MCP_TOKEN is required when the network MCP server is enabled")
 
 
 class StaticTokenVerifier(TokenVerifier):
@@ -32,8 +30,13 @@ class StaticTokenVerifier(TokenVerifier):
         )
 
 
-mcp = MCPServer(
+mcp = FastMCP(
     "ZybookAuto",
+    host=HOST,
+    port=PORT,
+    streamable_http_path="/mcp",
+    stateless_http=True,
+    json_response=True,
     token_verifier=StaticTokenVerifier(),
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(os.getenv("ZYBOOKAUTO_MCP_ISSUER", f"http://localhost:{PORT}/")),
@@ -181,9 +184,4 @@ def get_progress(limit: int = 50) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host=HOST,
-        port=PORT,
-        streamable_http_path="/mcp",
-    )
+    mcp.run(transport="streamable-http")
