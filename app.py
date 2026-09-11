@@ -25,7 +25,7 @@ class Store:
         self._init_db()
 
     def _conn(self):
-        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -50,6 +50,9 @@ class Store:
                 );
                 """
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES('worker_enabled', '1')"
+            )
 
     def set(self, key: str, value: str):
         with self.lock, self._conn() as conn:
@@ -62,6 +65,12 @@ class Store:
         with self._conn() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default
+
+    def worker_enabled(self) -> bool:
+        return self.get("worker_enabled", "1") == "1"
+
+    def set_worker_enabled(self, enabled: bool):
+        self.set("worker_enabled", "1" if enabled else "0")
 
     def enqueue(self, book_code: str, chapter: int, section: int, title: str) -> int:
         with self.lock, self._conn() as conn:
@@ -84,23 +93,71 @@ class Store:
         return [dict(r) for r in rows]
 
     def next_queued(self) -> dict[str, Any] | None:
-        with self.lock, self._conn() as conn:
-            row = conn.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id ASC LIMIT 1").fetchone()
-            if not row:
+        """Atomically claim one job, but only when no other job is running.
+
+        SQLite's IMMEDIATE transaction serializes claims across processes, so even
+        if another process accidentally tries to run a worker it cannot create a
+        second simultaneous `running` job.
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            running = conn.execute(
+                "SELECT id FROM jobs WHERE status='running' LIMIT 1"
+            ).fetchone()
+            if running:
+                conn.commit()
                 return None
-            conn.execute("UPDATE jobs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
-        return dict(row)
+
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE status='queued' ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                conn.commit()
+                return None
+
+            conn.execute(
+                "UPDATE jobs SET status='running', error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (row["id"],),
+            )
+            conn.commit()
+            claimed = dict(row)
+            claimed["status"] = "running"
+            claimed["error"] = None
+            return claimed
+
+    def recover_stale_running(self) -> int:
+        """Requeue work left running by a previous crashed/restarted worker."""
+        with self.lock, self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status='queued',
+                    error='Recovered after service restart; requeued before execution resumed',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE status='running'
+                """
+            )
+            return cur.rowcount
+
+    def cancel_queued(self) -> int:
+        with self.lock, self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE status='queued'"
+            )
+            return cur.rowcount
 
     def clear_finished(self):
         with self.lock, self._conn() as conn:
-            conn.execute("DELETE FROM jobs WHERE status IN ('done','submitted','failed','cancelled')")
+            conn.execute(
+                "DELETE FROM jobs WHERE status IN ('done','submitted','failed','cancelled')"
+            )
 
 
 store = Store(DB_PATH)
 worker_stop = threading.Event()
-worker_pause = threading.Event()
-worker_pause.set()
 worker_thread: threading.Thread | None = None
+worker_start_lock = threading.Lock()
+worker_initialized = False
 activity_lock = threading.Lock()
 worker_activity: dict[str, Any] = {"stage": "idle"}
 
@@ -123,8 +180,9 @@ def build_client() -> ZybooksClient:
 
 def worker_loop():
     while not worker_stop.is_set():
-        worker_pause.wait(0.5)
-        if not worker_pause.is_set() or worker_stop.is_set():
+        if not store.worker_enabled():
+            set_activity(stage="paused")
+            time.sleep(0.5)
             continue
 
         job = store.next_queued()
@@ -145,7 +203,9 @@ def worker_loop():
             set_activity(**base, stage="signing_in")
             client = build_client()
             set_activity(**base, stage="checking_progress")
-            progress = client.get_section_progress(job["book_code"], job["chapter"], job["section"])
+            progress = client.get_section_progress(
+                job["book_code"], job["chapter"], job["section"]
+            )
             if progress.get("complete"):
                 store.update_job(job["id"], "done")
                 set_activity(**base, stage="already_complete")
@@ -170,15 +230,23 @@ def worker_loop():
 
             set_activity(**base, stage="verifying", **result)
             time.sleep(1)
-            verify = client.get_section_progress(job["book_code"], job["chapter"], job["section"])
+            verify = client.get_section_progress(
+                job["book_code"], job["chapter"], job["section"]
+            )
             if verify.get("complete"):
                 store.update_job(job["id"], "done")
                 set_activity(**base, stage="verified_complete", **result)
             elif result.get("accepted"):
-                store.update_job(job["id"], "submitted", "Submission accepted; read-back endpoint did not expose a completed state")
+                store.update_job(
+                    job["id"],
+                    "submitted",
+                    "Submission accepted; read-back endpoint did not expose a completed state",
+                )
                 set_activity(**base, stage="submitted_unverified", **result)
             else:
-                store.update_job(job["id"], "failed", "No accepted activity submissions were recorded")
+                store.update_job(
+                    job["id"], "failed", "No accepted activity submissions were recorded"
+                )
                 set_activity(**base, stage="failed")
         except Exception as exc:
             store.update_job(job["id"], "failed", str(exc))
@@ -186,12 +254,21 @@ def worker_loop():
 
 
 def ensure_worker():
-    global worker_thread
-    if worker_thread and worker_thread.is_alive():
-        return
-    worker_stop.clear()
-    worker_thread = threading.Thread(target=worker_loop, daemon=True)
-    worker_thread.start()
+    """Start the sole executor thread owned by the web/application process."""
+    global worker_thread, worker_initialized
+    with worker_start_lock:
+        if worker_thread and worker_thread.is_alive():
+            return
+        if not worker_initialized:
+            recovered = store.recover_stale_running()
+            worker_initialized = True
+            if recovered:
+                set_activity(stage="recovered", recovered_jobs=recovered)
+        worker_stop.clear()
+        worker_thread = threading.Thread(
+            target=worker_loop, daemon=True, name="zybookauto-worker"
+        )
+        worker_thread.start()
 
 
 @app.get("/")
@@ -235,7 +312,10 @@ def api_queue():
     payload = request.get_json(force=True)
     code = payload["book_code"]
     items = payload.get("items", [])
-    ids = [store.enqueue(code, int(i["chapter"]), int(i["section"]), i.get("title", "")) for i in items]
+    ids = [
+        store.enqueue(code, int(i["chapter"]), int(i["section"]), i.get("title", ""))
+        for i in items
+    ]
     ensure_worker()
     return jsonify({"queued": len(ids), "ids": ids})
 
@@ -244,12 +324,18 @@ def api_queue():
 def api_jobs():
     with activity_lock:
         activity = dict(worker_activity)
-    return jsonify({"jobs": store.jobs(), "paused": not worker_pause.is_set(), "activity": activity})
+    return jsonify(
+        {
+            "jobs": store.jobs(),
+            "paused": not store.worker_enabled(),
+            "activity": activity,
+        }
+    )
 
 
 @app.post("/api/jobs/pause")
 def api_pause():
-    worker_pause.clear()
+    store.set_worker_enabled(False)
     set_activity(stage="paused")
     return jsonify({"ok": True})
 
@@ -257,17 +343,16 @@ def api_pause():
 @app.post("/api/jobs/resume")
 def api_resume():
     ensure_worker()
-    worker_pause.set()
+    store.set_worker_enabled(True)
     return jsonify({"ok": True})
 
 
 @app.post("/api/jobs/stop")
 def api_stop():
-    worker_pause.clear()
-    with store.lock, store._conn() as conn:
-        conn.execute("UPDATE jobs SET status='cancelled' WHERE status='queued'")
+    store.set_worker_enabled(False)
+    cancelled = store.cancel_queued()
     set_activity(stage="paused")
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "cancelled": cancelled})
 
 
 @app.post("/api/jobs/clear")
@@ -278,4 +363,8 @@ def api_clear():
 
 if __name__ == "__main__":
     ensure_worker()
-    app.run(host=os.getenv("APP_HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8765")), debug=False)
+    app.run(
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8765")),
+        debug=False,
+    )
