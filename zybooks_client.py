@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from typing import Callable
 from urllib import parse
 
 import requests
@@ -105,32 +106,18 @@ class ZybooksClient:
     def get_section_progress(self, code: str, chapter: int, section: int):
         data = self.get_section(code, chapter, section)
         resources = data.get("content_resources", [])
-        completable = [
-            r for r in resources
-            if self._part_count(r) > 0 or "activity" in str(r.get("type", "")).lower()
-        ]
+        completable = [r for r in resources if self._part_count(r) > 0 or "activity" in str(r.get("type", "")).lower()]
         completed = sum(1 for r in completable if self._resource_complete(r))
         total = len(completable)
-        return {
-            "complete": total > 0 and completed == total,
-            "completed": completed,
-            "total": total,
-            "resources": resources,
-        }
+        return {"complete": total > 0 and completed == total, "completed": completed, "total": total, "resources": resources}
 
     def get_book_outline_with_progress(self, code: str):
         chapters = self.get_chapters(code)
         output = []
         jobs = []
-
         for chapter in chapters:
-            chapter_view = {
-                "number": chapter["number"],
-                "title": chapter.get("title", ""),
-                "sections": [],
-            }
+            chapter_view = {"number": chapter["number"], "title": chapter.get("title", ""), "sections": []}
             output.append(chapter_view)
-
             for section in chapter.get("sections", []):
                 sec_num = section.get("canonical_section_number", section.get("number"))
                 section_view = {
@@ -141,28 +128,15 @@ class ZybooksClient:
                 }
                 chapter_view["sections"].append(section_view)
                 jobs.append((int(chapter["number"]), int(sec_num), section_view))
-
-        # The old implementation fetched every section one-by-one. Large books could
-        # therefore take many minutes. Limit concurrency so the sync is much faster
-        # without flooding ZyBooks with requests.
         workers = min(8, max(1, len(jobs)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {
-                pool.submit(self.get_section_progress, code, chapter_num, section_num): section_view
-                for chapter_num, section_num, section_view in jobs
-            }
+            future_map = {pool.submit(self.get_section_progress, code, c, s): view for c, s, view in jobs}
             for future in as_completed(future_map):
-                section_view = future_map[future]
+                view = future_map[future]
                 try:
-                    section_view["progress"] = future.result()
+                    view["progress"] = future.result()
                 except Exception as exc:
-                    section_view["progress"] = {
-                        "complete": False,
-                        "completed": 0,
-                        "total": 0,
-                        "error": str(exc),
-                    }
-
+                    view["progress"] = {"complete": False, "completed": 0, "total": 0, "error": str(exc)}
         return {"book_code": code, "chapters": output}
 
     def _buildkey(self):
@@ -171,7 +145,6 @@ class ZybooksClient:
 
         class Parser(HTMLParser):
             value = None
-
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
                 if tag == "meta" and attrs.get("name") == "zybooks-web/config/environment":
@@ -188,15 +161,13 @@ class ZybooksClient:
 
     @staticmethod
     def _timestamp():
-        now = datetime.now(timezone.utc)
-        return now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     def _checksum(self, activity_id, timestamp, part):
         raw = f"content_resource/{activity_id}/activity{timestamp}{self.auth_token}{activity_id}{part}true{self._buildkey()}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
-    def _mark_part(self, code: str, section_id: int, activity_id: int, part: int, delay: float):
-        time.sleep(max(0.0, delay))
+    def _mark_part(self, code: str, section_id: int, activity_id: int, part: int):
         ts = self._timestamp()
         payload = {
             "part": part,
@@ -207,19 +178,41 @@ class ZybooksClient:
             "timestamp": ts,
             "__cs__": self._checksum(activity_id, ts, part),
         }
-        return self._json(self.session.post(
+        data = self._json(self.session.post(
             f"{self.API}/content_resource/{activity_id}/activity",
             json=payload,
             timeout=15,
         ))
+        if isinstance(data, dict) and data.get("success") is False:
+            raise ZybooksError(str(data))
+        return data
 
-    def complete_section(self, code: str, chapter: int, section: int, *, min_delay=8.0, max_delay=18.0, retries=3):
+    def complete_section(
+        self,
+        code: str,
+        chapter: int,
+        section: int,
+        *,
+        min_delay=8.0,
+        max_delay=18.0,
+        retries=3,
+        progress_callback: Callable[[dict], None] | None = None,
+    ):
+        def emit(**event):
+            if progress_callback:
+                progress_callback(event)
+
         data = self.get_section(code, chapter, section)
         section_id = data.get("canonical_section_id")
         if section_id is None:
             raise ZybooksError("Section has no canonical_section_id")
 
-        for resource in data.get("content_resources", []):
+        resources = [r for r in data.get("content_resources", []) if self._part_count(r) > 0]
+        total_parts = sum(self._part_count(r) for r in resources if not self._resource_complete(r))
+        submitted = 0
+        emit(stage="starting", total_parts=total_parts, submitted=0)
+
+        for resource_index, resource in enumerate(resources, start=1):
             if self._resource_complete(resource):
                 continue
             activity_id = resource.get("id")
@@ -228,20 +221,42 @@ class ZybooksClient:
                 continue
 
             for part in range(raw_parts):
+                delay = random.uniform(min(min_delay, max_delay), max(min_delay, max_delay))
+                emit(
+                    stage="waiting",
+                    activity=resource_index,
+                    activities=len(resources),
+                    part=part + 1,
+                    parts=raw_parts,
+                    delay=round(delay, 1),
+                    submitted=submitted,
+                    total_parts=total_parts,
+                )
+                time.sleep(max(0.0, delay))
                 last_error = None
                 for attempt in range(max(1, retries)):
                     try:
-                        self._mark_part(
-                            code,
-                            int(section_id),
-                            int(activity_id),
-                            part,
-                            random.uniform(min(min_delay, max_delay), max(min_delay, max_delay)),
+                        emit(
+                            stage="submitting",
+                            activity=resource_index,
+                            activities=len(resources),
+                            part=part + 1,
+                            parts=raw_parts,
+                            attempt=attempt + 1,
+                            submitted=submitted,
+                            total_parts=total_parts,
                         )
+                        self._mark_part(code, int(section_id), int(activity_id), part)
+                        submitted += 1
+                        emit(stage="accepted", submitted=submitted, total_parts=total_parts)
                         last_error = None
                         break
                     except Exception as exc:
                         last_error = exc
+                        emit(stage="retrying", error=str(exc), attempt=attempt + 1, submitted=submitted, total_parts=total_parts)
                         time.sleep(min(30, 2 ** attempt + random.random()))
                 if last_error:
                     raise ZybooksError(f"Activity {activity_id} part {part + 1} failed: {last_error}")
+
+        emit(stage="submitted", submitted=submitted, total_parts=total_parts)
+        return {"submitted_parts": submitted, "total_parts": total_parts, "accepted": submitted > 0 or total_parts == 0}
