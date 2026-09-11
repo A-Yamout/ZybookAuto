@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import os
-import queue
-import random
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, redirect, render_template, request, session as flask_session, url_for
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from zybooks_client import ZybooksClient, ZybooksError
 
@@ -19,17 +16,6 @@ SECRET_KEY = os.getenv("ZYBOOKAUTO_SECRET", "dev-only-change-me")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-
-
-@dataclass
-class Job:
-    id: int
-    book_code: str
-    chapter: int
-    section: int
-    title: str
-    status: str
-    error: str | None = None
 
 
 class Store:
@@ -107,7 +93,7 @@ class Store:
 
     def clear_finished(self):
         with self.lock, self._conn() as conn:
-            conn.execute("DELETE FROM jobs WHERE status IN ('done','failed','cancelled')")
+            conn.execute("DELETE FROM jobs WHERE status IN ('done','submitted','failed','cancelled')")
 
 
 store = Store(DB_PATH)
@@ -115,6 +101,14 @@ worker_stop = threading.Event()
 worker_pause = threading.Event()
 worker_pause.set()
 worker_thread: threading.Thread | None = None
+activity_lock = threading.Lock()
+worker_activity: dict[str, Any] = {"stage": "idle"}
+
+
+def set_activity(**kwargs):
+    global worker_activity
+    with activity_lock:
+        worker_activity = kwargs
 
 
 def build_client() -> ZybooksClient:
@@ -135,36 +129,60 @@ def worker_loop():
 
         job = store.next_queued()
         if not job:
+            set_activity(stage="idle")
             time.sleep(1)
             continue
 
+        base = {
+            "job_id": job["id"],
+            "book_code": job["book_code"],
+            "chapter": job["chapter"],
+            "section": job["section"],
+            "title": job["title"],
+        }
+
         try:
+            set_activity(**base, stage="signing_in")
             client = build_client()
+            set_activity(**base, stage="checking_progress")
             progress = client.get_section_progress(job["book_code"], job["chapter"], job["section"])
             if progress.get("complete"):
                 store.update_job(job["id"], "done")
+                set_activity(**base, stage="already_complete")
                 continue
 
             min_delay = float(store.get("min_delay", "8"))
             max_delay = float(store.get("max_delay", "18"))
             retries = int(store.get("retries", "3"))
 
-            client.complete_section(
+            def on_progress(event):
+                set_activity(**base, **event)
+
+            result = client.complete_section(
                 job["book_code"],
                 job["chapter"],
                 job["section"],
                 min_delay=min_delay,
                 max_delay=max_delay,
                 retries=retries,
+                progress_callback=on_progress,
             )
 
+            set_activity(**base, stage="verifying", **result)
+            time.sleep(1)
             verify = client.get_section_progress(job["book_code"], job["chapter"], job["section"])
             if verify.get("complete"):
                 store.update_job(job["id"], "done")
+                set_activity(**base, stage="verified_complete", **result)
+            elif result.get("accepted"):
+                store.update_job(job["id"], "submitted", "Submission accepted; read-back endpoint did not expose a completed state")
+                set_activity(**base, stage="submitted_unverified", **result)
             else:
-                store.update_job(job["id"], "failed", "ZyBooks did not report the section complete after verification")
+                store.update_job(job["id"], "failed", "No accepted activity submissions were recorded")
+                set_activity(**base, stage="failed")
         except Exception as exc:
             store.update_job(job["id"], "failed", str(exc))
+            set_activity(**base, stage="failed", error=str(exc))
 
 
 def ensure_worker():
@@ -178,10 +196,8 @@ def ensure_worker():
 
 @app.get("/")
 def index():
-    configured = bool(store.get("email") or os.getenv("ZYBOOKS_EMAIL"))
     return render_template(
         "index.html",
-        configured=configured,
         min_delay=store.get("min_delay", "8"),
         max_delay=store.get("max_delay", "18"),
         retries=store.get("retries", "3"),
@@ -219,24 +235,22 @@ def api_queue():
     payload = request.get_json(force=True)
     code = payload["book_code"]
     items = payload.get("items", [])
-    ids = []
-    for item in items:
-        ids.append(store.enqueue(code, int(item["chapter"]), int(item["section"]), item.get("title", "")))
+    ids = [store.enqueue(code, int(i["chapter"]), int(i["section"]), i.get("title", "")) for i in items]
     ensure_worker()
     return jsonify({"queued": len(ids), "ids": ids})
 
 
 @app.get("/api/jobs")
 def api_jobs():
-    return jsonify({
-        "jobs": store.jobs(),
-        "paused": not worker_pause.is_set(),
-    })
+    with activity_lock:
+        activity = dict(worker_activity)
+    return jsonify({"jobs": store.jobs(), "paused": not worker_pause.is_set(), "activity": activity})
 
 
 @app.post("/api/jobs/pause")
 def api_pause():
     worker_pause.clear()
+    set_activity(stage="paused")
     return jsonify({"ok": True})
 
 
@@ -252,6 +266,7 @@ def api_stop():
     worker_pause.clear()
     with store.lock, store._conn() as conn:
         conn.execute("UPDATE jobs SET status='cancelled' WHERE status='queued'")
+    set_activity(stage="paused")
     return jsonify({"ok": True})
 
 
