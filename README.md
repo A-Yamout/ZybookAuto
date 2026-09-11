@@ -1,44 +1,228 @@
 # ZybookAuto
 
-ZybookAuto automates ZyBooks activity processing and now exposes a queue-based workflow that can be controlled from ChatGPT through the connected ZyBooks tool.
+ZybookAuto automates ZyBooks activity processing through a persistent queue, a local web dashboard, and an MCP interface that can be controlled by an AI agent.
 
-> **Note:** This project interacts with ZyBooks on your behalf. Use it only on accounts and coursework you are authorized to access, and make sure your use complies with your school and ZyBooks policies.
+> **Note:** Use this only on ZyBooks accounts and coursework you are authorized to access, and make sure your use complies with your course and ZyBooks policies.
+
+---
+
+## Current architecture
+
+The Docker deployment runs two services inside one container:
+
+- `app.py` — Flask dashboard **and the only background job executor**
+- `mcp_server.py` — Streamable HTTP MCP control interface
+
+Both processes share the same SQLite database. MCP never starts its own execution thread. It only adds jobs and changes shared queue control state in SQLite.
+
+This is important because older builds could accidentally create one worker in `app.py` and another in `mcp_server.py`, which allowed two jobs to appear as `running` at the same time.
+
+The worker now enforces:
+
+```text
+at most one running job
+```
+
+Job claiming uses an atomic SQLite transaction, so even an accidental second claimant cannot start another job while one is already running.
+
+---
+
+## Queue states
+
+Jobs can appear as:
+
+```text
+queued
+running
+done
+submitted
+failed
+cancelled
+```
+
+Typical flow:
+
+```text
+queued -> running -> done
+```
+
+`submitted` means the activity POST was accepted by ZyBooks, but the read-back response did not expose enough completion information to prove the whole section was complete. It is not the same as a failed submission.
+
+### Restart recovery
+
+If the container or worker process restarts while a job is marked `running`, that job is automatically changed back to `queued` when the sole worker starts again.
+
+Before redoing work, the worker refreshes the current ZyBooks section state. If ZyBooks already reports the section complete, the recovered job is marked `done` without resubmitting it.
+
+---
+
+## Shared worker controls
+
+Pause/resume state is stored in SQLite rather than in a process-local Python event. This means the dashboard and MCP server now control the same worker state.
+
+- **Resume / start** sets `worker_enabled=1`
+- **Pause** sets `worker_enabled=0`
+- **Stop queued work** pauses the worker and marks all not-yet-started jobs `cancelled`
+
+Pausing does not interrupt a section that is already executing. It prevents the next queued job from starting.
 
 ---
 
 ## What it can do
 
-The current ChatGPT integration supports:
+The current integration supports:
 
-- List the ZyBooks available to the configured account
+- List ZyBooks available to the configured account
+- Read chapter and section completion state
 - Queue an entire chapter
+- Skip sections already reported complete
 - Queue specific sections such as `1.1`, `1.3`, and `2.4`
 - Start or resume queued work
-- Pause the worker before it begins the next queued job
-- Cancel jobs that have not started yet
-- Check queue state, running jobs, recent jobs, and counts
-- Attempt to skip sections that are already complete when a chapter is queued
-
-The queue runs separately from the ChatGPT conversation, so ChatGPT can submit work, inspect its state, and control the worker through the tool interface.
+- Pause before the next job
+- Cancel work that has not started
+- Report current queue state and recent jobs
+- Run continuously in Docker
+- Expose an authenticated Streamable HTTP MCP endpoint
 
 ---
 
-## Example ChatGPT workflow
+## Completion detection
 
-Once the ZyBooks tool is connected, you can use normal language in ChatGPT.
+Completion checks are refreshed directly from ZyBooks before chapter queue decisions are made.
 
-Examples:
+The client recognizes multiple completion representations used by ZyBooks, including:
+
+- `complete` / `completed` flags
+- completed/total counters
+- percentage values
+- nested progress objects
+- part-level completion state
+- section-level completion fallback data
+
+The MCP `queue_chapter` response includes `completion_checks` so an agent can inspect why a section was queued or skipped.
+
+Issue #3 covered the older stale/incomplete completion detection behavior and has been resolved.
+
+---
+
+## Dashboard
+
+By default the dashboard is available at:
+
+```text
+http://localhost:8765
+```
+
+When accessed from another machine, replace `localhost` with the Docker host's IP address.
+
+The dashboard provides:
+
+- Book selection
+- Chapter/section selection
+- Collapsed chapters with chapter-level select-all
+- Queue controls
+- Worker status
+- Live execution telemetry
+- Recent job history
+
+---
+
+## MCP server
+
+The MCP server uses **Streamable HTTP**.
+
+Default endpoint:
+
+```text
+http://localhost:20030/mcp
+```
+
+For a public deployment behind Cloudflare Tunnel, set:
+
+```text
+ZYBOOKAUTO_MCP_PUBLIC_URL=https://mcp.example.com/mcp
+```
+
+The MCP server requires a bearer token:
+
+```text
+Authorization: Bearer <ZYBOOKAUTO_MCP_TOKEN>
+```
+
+Current MCP tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `list_books` | List configured ZyBooks |
+| `queue_chapter` | Queue a chapter and optionally skip completed sections |
+| `queue_sections` | Queue selected sections |
+| `start_queue` | Enable/resume the shared worker |
+| `pause_queue` | Pause before the next job starts |
+| `stop_queued_work` | Pause and cancel queued jobs |
+| `get_progress` | Return counts, current running job, and recent jobs |
+
+Because `mcp_server.py` is a separate process, it intentionally does **not** call `ensure_worker()`. `app.py` owns execution for the lifetime of the service.
+
+---
+
+## Docker Compose
+
+Build and start in the background:
+
+```bash
+docker compose up -d --build
+```
+
+Check status:
+
+```bash
+docker compose ps
+```
+
+Watch logs:
+
+```bash
+docker compose logs -f zybookauto
+```
+
+Stop the service:
+
+```bash
+docker compose down
+```
+
+The SQLite database is stored in the persistent `zybookauto-data` Docker volume, so rebuilding the image does not erase queue state or saved settings.
+
+### Environment variables
+
+A typical `.env` file can contain:
+
+```text
+ZYBOOKS_EMAIL=student@example.com
+ZYBOOKS_PASSWORD=replace-me
+ZYBOOKAUTO_SECRET=replace-with-a-random-secret
+ZYBOOKAUTO_MCP_TOKEN=replace-with-a-long-random-token
+ZYBOOKAUTO_MCP_PUBLIC_URL=https://mcp.example.com/mcp
+```
+
+Generate a random MCP token with:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+```
+
+---
+
+## Example agent workflow
+
+Once the MCP server is connected to an AI agent, normal requests can map to the MCP tools.
 
 ```text
 What ZyBooks do I have?
 ```
 
 ```text
-Do the entire first chapter.
-```
-
-```text
-Queue sections 2.1, 2.3, and 2.5.
+Queue chapter 1, skipping anything already complete.
 ```
 
 ```text
@@ -46,114 +230,60 @@ Start the queue.
 ```
 
 ```text
-Check my ZyBooks progress.
+How far along is it?
 ```
 
 ```text
 Pause after the current section.
 ```
 
-```text
-Cancel everything that has not started yet.
-```
-
-For a full chapter, ChatGPT first queues the chapter and then starts the worker. By default, the chapter queue is configured to skip sections that the backend reports as already complete.
+The AI agent can inspect `get_progress` later without interrupting the worker.
 
 ---
 
-## Queue behavior
+## ZyBooks authentication
 
-A queued job generally moves through these states:
+The project includes the newer ZyBooks authentication behavior required after the API change that caused `Ill-formatted request` errors in older builds.
 
-```text
-queued -> running -> finished
-```
+Current behavior:
 
-The progress tool can report:
-
-- Whether the worker is paused
-- The currently running job
-- Number of queued jobs
-- Number of running jobs
-- Recent job information
-- Errors returned by jobs
-
-### Pause
-
-Pausing does not interrupt the job that is already running. It prevents the worker from beginning another queued job after the current one finishes.
-
-### Stop / cancel queued work
-
-Stopping queued work removes jobs that have **not started yet** and pauses the worker.
-
-A job that is already running cannot currently be selectively removed through the ChatGPT tool interface.
+- Sign-in retrieves the `auth_token`
+- The requests session sets `Authorization: Bearer <token>`
+- GET requests do not send the deprecated token query parameter
+- Activity POST requests retain the token in the request body where required for compatibility
 
 ---
 
-## Known issue: completed-section detection
+## Tests
 
-The current `skip_complete` behavior is **not fully reliable**.
-
-During testing, sections `1.6` and `1.7` were already complete in ZyBooks but were still queued when Chapter 1 was submitted with completed sections set to be skipped.
-
-Until this is fixed, do not treat the automatic completion check as authoritative. If you know which sections are already complete, the safest approach is to queue only the specific sections that still need work.
-
-Tracking issue: **#3 - Completed ZyBooks sections are not reliably detected before queueing**.
-
-A future fix should refresh completion information immediately before queue creation, avoid stale cached state, and verify section completion more directly.
-
----
-
-## Current tool operations
-
-The ChatGPT-facing integration currently exposes operations equivalent to:
-
-| Operation | Purpose |
-| --- | --- |
-| `list_books` | List ZyBooks available to the configured account |
-| `queue_chapter` | Queue every section in a chapter, optionally skipping completed sections |
-| `queue_sections` | Queue specific section numbers |
-| `start_queue` | Start or resume processing |
-| `pause_queue` | Pause before the next queued job begins |
-| `stop_queued_work` | Cancel jobs that have not started and pause the worker |
-| `get_progress` | Return worker state, counts, running job details, and recent jobs |
-
----
-
-## Installation / legacy script
-
-The original Python script requires the `requests` package:
+Run the unit tests with:
 
 ```bash
-pip install requests
+python -m unittest discover -s tests
 ```
 
-The repository originally operated as a direct Python automation script. The current setup adds a service/tool layer around that functionality so it can be controlled remotely from ChatGPT rather than requiring every action to be started manually from the command line.
+Regression coverage includes:
+
+- Completion-state parsing
+- Fresh completed/incomplete section handling
+- Only one job being claimable as `running`
+- Recovery of stale `running` jobs after restart
+- Shared persisted worker pause/resume state
 
 ---
 
-## Authentication update
+## Development checklist
 
-ZyBooks authentication was updated to address the `Ill-formatted request` error caused by changes to how the ZyBooks API accepts authentication.
+When changing queue behavior, verify at minimum:
 
-Current behavior includes:
-
-- The sign-in flow retrieves the `auth_token`
-- The session uses an `Authorization: Bearer <token>` header
-- GET requests no longer rely on the deprecated token query parameter
-- POST requests retain legacy token handling where required
-
----
-
-## Development notes
-
-When changing the queue or ChatGPT integration, verify at minimum:
-
-1. A book can be listed successfully.
+1. Books can be listed successfully.
 2. Individual sections can be queued.
-3. A full chapter can be queued.
-4. Starting, pausing, and stopping the queue behave correctly.
-5. Progress accurately reflects queued and running jobs.
-6. Already-completed sections are detected against fresh ZyBooks state rather than stale cached data.
+3. A whole chapter can be queued.
+4. Already-completed sections are skipped using fresh ZyBooks state.
+5. Only one job can be `running` at a time.
+6. Dashboard and MCP pause/resume controls affect the same worker.
+7. Restarting the service recovers stale `running` jobs safely.
+8. MCP `get_progress` accurately reflects the database queue state.
+9. Docker starts both the dashboard and MCP processes successfully.
 
-If you encounter a bug, open a GitHub issue with the affected book/chapter/section, the queue state, and the expected versus observed behavior.
+If you encounter a bug, open a GitHub issue with the affected book/chapter/section, current queue state, expected behavior, and observed behavior.
