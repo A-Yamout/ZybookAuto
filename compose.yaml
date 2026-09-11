@@ -1,0 +1,21 @@
+services:
+  zybookauto:
+    build: .
+    container_name: zybookauto
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+      - "20030:20030"
+    environment:
+      PORT: "8765"
+      ZYBOOKAUTO_DB: /data/zybookauto.db
+      ZYBOOKAUTO_SECRET: ${ZYBOOKAUTO_SECRET:-change-me}
+      ZYBOOKS_EMAIL: ${ZYBOOKS_EMAIL:-}
+      ZYBOOKS_PASSWORD: ${ZYBOOKS_PASSWORD:-}
+      ZYBOOKAUTO_MCP_HOST: 0.0.0.0
+      ZYBOOKAUTO_MCP_PORT: "20030"
+    volumes:
+      - zybookauto-data:/data
+
+volumes:
+  zybookauto-data:
