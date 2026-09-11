@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib import parse
@@ -41,7 +42,7 @@ class ZybooksClient:
         data = self._json(self.session.post(
             f"{self.API}/signin",
             json={"email": self.email, "password": self.password},
-            timeout=30,
+            timeout=15,
         ))
         self.auth_token = data["session"]["auth_token"]
         self.user_id = str(data["session"]["user_id"])
@@ -52,7 +53,7 @@ class ZybooksClient:
         data = self._json(self.session.get(
             f"{self.API}/user/{self.user_id}/items",
             params={"items": '["zybooks"]'},
-            timeout=30,
+            timeout=15,
         ))
         return [b for b in data["items"]["zybooks"] if not b.get("autosubscribe")]
 
@@ -60,15 +61,24 @@ class ZybooksClient:
         data = self._json(self.session.get(
             f"{self.API}/zybooks",
             params={"zybooks": json.dumps([code])},
-            timeout=30,
+            timeout=15,
         ))
         return data["zybooks"][0]["chapters"]
 
     def get_section(self, code: str, chapter: int, section: int):
         return self._json(self.session.get(
             f"{self.API}/zybook/{code}/chapter/{chapter}/section/{section}",
-            timeout=30,
+            timeout=12,
         ))["section"]
+
+    @staticmethod
+    def _part_count(resource: dict) -> int:
+        parts = resource.get("parts", 0)
+        if isinstance(parts, int):
+            return max(0, parts)
+        if isinstance(parts, list):
+            return len(parts)
+        return 0
 
     @staticmethod
     def _resource_complete(resource: dict) -> bool:
@@ -77,9 +87,9 @@ class ZybooksClient:
         parts = resource.get("parts")
         if isinstance(parts, list) and parts:
             states = []
-            for p in parts:
-                if isinstance(p, dict):
-                    states.append(bool(p.get("complete") or p.get("completed")))
+            for part in parts:
+                if isinstance(part, dict):
+                    states.append(bool(part.get("complete") or part.get("completed")))
             if states:
                 return all(states)
         progress = resource.get("progress")
@@ -95,7 +105,10 @@ class ZybooksClient:
     def get_section_progress(self, code: str, chapter: int, section: int):
         data = self.get_section(code, chapter, section)
         resources = data.get("content_resources", [])
-        completable = [r for r in resources if int(r.get("parts", 0) or 0) > 0 or "activity" in str(r.get("type", "")).lower()]
+        completable = [
+            r for r in resources
+            if self._part_count(r) > 0 or "activity" in str(r.get("type", "")).lower()
+        ]
         completed = sum(1 for r in completable if self._resource_complete(r))
         total = len(completable)
         return {
@@ -108,21 +121,48 @@ class ZybooksClient:
     def get_book_outline_with_progress(self, code: str):
         chapters = self.get_chapters(code)
         output = []
+        jobs = []
+
         for chapter in chapters:
-            c = {"number": chapter["number"], "title": chapter.get("title", ""), "sections": []}
+            chapter_view = {
+                "number": chapter["number"],
+                "title": chapter.get("title", ""),
+                "sections": [],
+            }
+            output.append(chapter_view)
+
             for section in chapter.get("sections", []):
                 sec_num = section.get("canonical_section_number", section.get("number"))
-                try:
-                    progress = self.get_section_progress(code, int(chapter["number"]), int(sec_num))
-                except Exception as exc:
-                    progress = {"complete": False, "completed": 0, "total": 0, "error": str(exc)}
-                c["sections"].append({
+                section_view = {
                     "number": sec_num,
                     "title": section.get("title", ""),
                     "canonical_section_id": section.get("canonical_section_id"),
-                    "progress": progress,
-                })
-            output.append(c)
+                    "progress": {"complete": False, "completed": 0, "total": 0, "loading": True},
+                }
+                chapter_view["sections"].append(section_view)
+                jobs.append((int(chapter["number"]), int(sec_num), section_view))
+
+        # The old implementation fetched every section one-by-one. Large books could
+        # therefore take many minutes. Limit concurrency so the sync is much faster
+        # without flooding ZyBooks with requests.
+        workers = min(8, max(1, len(jobs)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(self.get_section_progress, code, chapter_num, section_num): section_view
+                for chapter_num, section_num, section_view in jobs
+            }
+            for future in as_completed(future_map):
+                section_view = future_map[future]
+                try:
+                    section_view["progress"] = future.result()
+                except Exception as exc:
+                    section_view["progress"] = {
+                        "complete": False,
+                        "completed": 0,
+                        "total": 0,
+                        "error": str(exc),
+                    }
+
         return {"book_code": code, "chapters": output}
 
     def _buildkey(self):
@@ -131,6 +171,7 @@ class ZybooksClient:
 
         class Parser(HTMLParser):
             value = None
+
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
                 if tag == "meta" and attrs.get("name") == "zybooks-web/config/environment":
@@ -139,7 +180,7 @@ class ZybooksClient:
                         self.value = json.loads(parse.unquote(content))["APP"]["BUILDKEY"]
 
         parser = Parser()
-        parser.feed(self.session.get("https://learn.zybooks.com", timeout=30).text)
+        parser.feed(self.session.get("https://learn.zybooks.com", timeout=15).text)
         if not parser.value:
             raise ZybooksError("Could not determine ZyBooks build key")
         self._build_key = parser.value
@@ -169,7 +210,7 @@ class ZybooksClient:
         return self._json(self.session.post(
             f"{self.API}/content_resource/{activity_id}/activity",
             json=payload,
-            timeout=30,
+            timeout=15,
         ))
 
     def complete_section(self, code: str, chapter: int, section: int, *, min_delay=8.0, max_delay=18.0, retries=3):
@@ -182,8 +223,8 @@ class ZybooksClient:
             if self._resource_complete(resource):
                 continue
             activity_id = resource.get("id")
-            raw_parts = resource.get("parts", 0)
-            if not activity_id or not isinstance(raw_parts, int) or raw_parts <= 0:
+            raw_parts = self._part_count(resource)
+            if not activity_id or raw_parts <= 0:
                 continue
 
             for part in range(raw_parts):
