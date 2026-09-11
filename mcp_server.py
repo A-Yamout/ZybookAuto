@@ -55,7 +55,7 @@ def list_books() -> list[dict[str, Any]]:
 
 @mcp.tool()
 def queue_chapter(book_code: str, chapter_number: int, skip_complete: bool = True) -> dict[str, Any]:
-    """Queue all sections in one chapter. By default, sections already complete are skipped."""
+    """Queue all sections in one chapter after refreshing each section's completion state."""
     client = build_client()
     chapters = client.get_chapters(book_code)
     chapter = next((c for c in chapters if int(c.get("number", -1)) == int(chapter_number)), None)
@@ -64,22 +64,41 @@ def queue_chapter(book_code: str, chapter_number: int, skip_complete: bool = Tru
 
     queued = []
     skipped = []
+    checks = []
     for section in chapter.get("sections", []):
         section_number = int(section.get("canonical_section_number", section.get("number")))
         title = section.get("title", "")
+        progress = None
 
         if skip_complete:
             try:
                 progress = client.get_section_progress(book_code, int(chapter_number), section_number)
+                checks.append({
+                    "section": section_number,
+                    "complete": bool(progress.get("complete")),
+                    "completed": progress.get("completed", 0),
+                    "total": progress.get("total", 0),
+                    "reason": progress.get("reason", "no reason reported"),
+                })
                 if progress.get("complete"):
-                    skipped.append({"section": section_number, "title": title, "reason": "already complete"})
+                    skipped.append({
+                        "section": section_number,
+                        "title": title,
+                        "reason": progress.get("reason", "already complete"),
+                    })
                     continue
             except Exception as exc:
                 skipped.append({"section": section_number, "title": title, "reason": f"progress check failed: {exc}"})
+                checks.append({"section": section_number, "complete": None, "reason": f"progress check failed: {exc}"})
                 continue
 
         job_id = store.enqueue(book_code, int(chapter_number), section_number, title)
-        queued.append({"job_id": job_id, "section": section_number, "title": title})
+        queued.append({
+            "job_id": job_id,
+            "section": section_number,
+            "title": title,
+            "completion_check": progress.get("reason") if progress else "skip_complete disabled",
+        })
 
     ensure_worker()
     return {
@@ -89,6 +108,7 @@ def queue_chapter(book_code: str, chapter_number: int, skip_complete: bool = Tru
         "skipped_count": len(skipped),
         "queued": queued,
         "skipped": skipped,
+        "completion_checks": checks,
         "worker_paused": not worker_pause.is_set(),
     }
 
