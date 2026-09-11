@@ -14,6 +14,8 @@ services:
       ZYBOOKS_PASSWORD: ${ZYBOOKS_PASSWORD:-}
       ZYBOOKAUTO_MCP_HOST: 0.0.0.0
       ZYBOOKAUTO_MCP_PORT: "20030"
+      ZYBOOKAUTO_MCP_TOKEN: ${ZYBOOKAUTO_MCP_TOKEN:?Set ZYBOOKAUTO_MCP_TOKEN in .env}
+      ZYBOOKAUTO_MCP_PUBLIC_URL: ${ZYBOOKAUTO_MCP_PUBLIC_URL:-http://localhost:20030/mcp}
     volumes:
       - zybookauto-data:/data
 
