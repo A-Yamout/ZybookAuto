@@ -9,6 +9,7 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
 from app import build_client, store
+from section_numbers import section_number
 
 HOST = os.getenv("ZYBOOKAUTO_MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("ZYBOOKAUTO_MCP_PORT", "20030"))
@@ -73,20 +74,18 @@ def queue_chapter(
     skipped = []
     checks = []
     for section in chapter.get("sections", []):
-        section_number = int(
-            section.get("canonical_section_number", section.get("number"))
-        )
+        section_index = section_number(section, int(chapter_number))
         title = section.get("title", "")
         progress = None
 
         if skip_complete:
             try:
                 progress = client.get_section_progress(
-                    book_code, int(chapter_number), section_number
+                    book_code, int(chapter_number), section_index
                 )
                 checks.append(
                     {
-                        "section": section_number,
+                        "section": section_index,
                         "complete": bool(progress.get("complete")),
                         "completed": progress.get("completed", 0),
                         "total": progress.get("total", 0),
@@ -96,7 +95,7 @@ def queue_chapter(
                 if progress.get("complete"):
                     skipped.append(
                         {
-                            "section": section_number,
+                            "section": section_index,
                             "title": title,
                             "reason": progress.get("reason", "already complete"),
                         }
@@ -105,25 +104,25 @@ def queue_chapter(
             except Exception as exc:
                 skipped.append(
                     {
-                        "section": section_number,
+                        "section": section_index,
                         "title": title,
                         "reason": f"progress check failed: {exc}",
                     }
                 )
                 checks.append(
                     {
-                        "section": section_number,
+                        "section": section_index,
                         "complete": None,
                         "reason": f"progress check failed: {exc}",
                     }
                 )
                 continue
 
-        job_id = store.enqueue(book_code, int(chapter_number), section_number, title)
+        job_id = store.enqueue(book_code, int(chapter_number), section_index, title)
         queued.append(
             {
                 "job_id": job_id,
-                "section": section_number,
+                "section": section_index,
                 "title": title,
                 "completion_check": (
                     progress.get("reason") if progress else "skip_complete disabled"
@@ -145,7 +144,7 @@ def queue_chapter(
 
 @mcp.tool()
 def queue_sections(book_code: str, sections: list[str]) -> dict[str, Any]:
-    """Queue specific sections written like ['1.1', '1.3', '2.4']."""
+    """Queue specific sections written like ['1.1', '1.3', '1.10', '2.4']."""
     client = build_client()
     chapters = {int(c["number"]): c for c in client.get_chapters(book_code)}
     queued = []
@@ -154,7 +153,7 @@ def queue_sections(book_code: str, sections: list[str]) -> dict[str, Any]:
         try:
             chapter_text, section_text = selector.split(".", 1)
             chapter_number = int(chapter_text)
-            section_number = int(section_text)
+            section_index = int(section_text)
         except Exception as exc:
             raise ValueError(f"Invalid section selector: {selector}") from exc
 
@@ -166,8 +165,7 @@ def queue_sections(book_code: str, sections: list[str]) -> dict[str, Any]:
             (
                 s
                 for s in chapter.get("sections", [])
-                if int(s.get("canonical_section_number", s.get("number")))
-                == section_number
+                if section_number(s, chapter_number) == section_index
             ),
             None,
         )
@@ -175,7 +173,7 @@ def queue_sections(book_code: str, sections: list[str]) -> dict[str, Any]:
             raise ValueError(f"Section {selector} was not found")
 
         title = section.get("title", "")
-        job_id = store.enqueue(book_code, chapter_number, section_number, title)
+        job_id = store.enqueue(book_code, chapter_number, section_index, title)
         queued.append({"job_id": job_id, "section": selector, "title": title})
 
     return {
