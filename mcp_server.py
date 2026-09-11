@@ -7,8 +7,10 @@ from mcp.server.fastmcp import FastMCP
 
 from app import build_client, ensure_worker, store, worker_pause
 
-HOST = os.getenv("ZYBOOKAUTO_MCP_HOST", "127.0.0.1")
-PORT = int(os.getenv("ZYBOOKAUTO_MCP_PORT", "8766"))
+# Intentionally unauthenticated and network-reachable, per project requirements.
+# 0.0.0.0 makes the MCP endpoint listen on every IPv4 interface.
+HOST = os.getenv("ZYBOOKAUTO_MCP_HOST", "0.0.0.0")
+PORT = int(os.getenv("ZYBOOKAUTO_MCP_PORT", "20030"))
 
 mcp = FastMCP(
     "ZybookAuto",
@@ -136,7 +138,7 @@ def get_progress(limit: int = 50) -> dict[str, Any]:
 
     running = next((job for job in jobs if job["status"] == "running"), None)
     total = sum(counts.values())
-    finished = counts.get("done", 0) + counts.get("accepted", 0) + counts.get("failed", 0) + counts.get("cancelled", 0)
+    finished = counts.get("done", 0) + counts.get("submitted", 0) + counts.get("accepted", 0) + counts.get("failed", 0) + counts.get("cancelled", 0)
 
     return {
         "worker_paused": not worker_pause.is_set(),
